@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -15,8 +15,10 @@ async function loadPlugin() {
   const deepseek = join(root, 'node_modules', '@deepseek-ai')
   const toolRoot = join(deepseek, 'dsh-tools')
   const schemaRoot = join(deepseek, 'schemastery')
+  const llmRoot = join(deepseek, 'dsh-llm')
   mkdirSync(toolRoot, { recursive: true })
   mkdirSync(schemaRoot, { recursive: true })
+  mkdirSync(llmRoot, { recursive: true })
   writeFileSync(
     join(toolRoot, 'package.json'),
     JSON.stringify({ name: '@deepseek-ai/dsh-tools', type: 'module', exports: './index.js' }),
@@ -34,10 +36,21 @@ async function loadPlugin() {
       '',
     ].join('\n'),
   )
+  writeFileSync(
+    join(llmRoot, 'package.json'),
+    JSON.stringify({ name: '@deepseek-ai/dsh-llm', type: 'module', exports: './index.js' }),
+  )
+  writeFileSync(
+    join(llmRoot, 'index.js'),
+    'export function createUserMessage(input) { return { id: "nudge", role: "user", ...input } }\n',
+  )
   mkdirSync(join(root, 'lib'))
-  for (const file of ['core.js', 'index.js']) {
+  for (const file of readdirSync(join(pluginRoot, 'lib')).filter((name) => name.endsWith('.js'))) {
     writeFileSync(join(root, 'lib', file), readFileSync(join(pluginRoot, 'lib', file)))
   }
+  // Keep the runtime config file inside the test sandbox.
+  mkdirSync(join(root, 'home'))
+  process.env.DSH_HOME = join(root, 'home')
   const module = await import(pathToFileURL(join(root, 'lib', 'index.js')).href)
   return { root, module }
 }
@@ -309,9 +322,9 @@ test('post-execute annotates long text results with an inline id', async () => {
     const text = decision.content[0].text
     const parsed = splitAnnotation(text)
     assert.equal(parsed.id, hashId(LONG))
-    assert.equal(parsed.chars, 2000)
+    assert.equal(parsed.chars, null, 'the short form omits the size')
     assert.equal(parsed.body, LONG)
-    assert.ok(text.startsWith(`[#${hashId(LONG)} · 2000 chars]\n`))
+    assert.equal(text, `[#${hashId(LONG)}]\n` + LONG, '12-character prefix, no size')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -339,7 +352,7 @@ test('annotation is skipped for short, non-text, replaced and already-annotated 
     }))
     assert.equal(replaced.value, 42)
 
-    const annotated = annotationFor(hashId(LONG), 2000) + LONG
+    const annotated = annotationFor(hashId(LONG)) + LONG
     const annotatedContent = [{ type: 'text', text: annotated }]
     const again = await handler({ name: 'ops_bash' }, { content: annotatedContent }, nextWith(annotatedContent))
     assert.equal(again.content, annotatedContent, 'no double annotation')
@@ -352,7 +365,7 @@ test('an inline-annotated result can be archived without listing first', async (
   const { root, module } = await loadPlugin()
   try {
     const id = hashId(LONG)
-    const annotated = annotationFor(id, 2000) + LONG
+    const annotated = annotationFor(id) + LONG
     const session = makeSession([
       ...pair('c0', 'ops_bash', annotated, { turn: 1 }),
       ...pair('c1', 'bash', LONG + 'a', { turn: 2 }),
@@ -395,14 +408,37 @@ test('annotate=false disables inline ids; annotateMinChars gates them', async ()
   try {
     const off = makeCtx(root)
     module.apply(off, { annotate: false })
-    assert.equal(off.handlers.has('tools/post-execute'), false, 'no hook when annotate is off')
+    const offHandler = off.handlers.get('tools/post-execute')
+    const content = [{ type: 'text', text: LONG }]
+    const kept = await offHandler({ name: 'ops_bash' }, { content }, async () => ({ kind: 'accept', content }))
+    assert.equal(kept.content, content, 'annotate=false keeps the result untouched')
 
     const high = makeCtx(root)
-    module.apply(high, { annotateMinChars: 5000 })
+    module.apply(high, { minChars: 5000 })
     const handler = high.handlers.get('tools/post-execute')
-    const content = [{ type: 'text', text: LONG }]
     const decision = await handler({ name: 'ops_bash' }, { content }, async () => ({ kind: 'accept', content }))
     assert.equal(decision.content, content, '2000-char result stays below the 5000 threshold')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a config file written at runtime applies to the next result (no restart)', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const ctx = makeCtx(root)
+    module.apply(ctx, { minChars: 2000 })
+    const handler = ctx.handlers.get('tools/post-execute')
+    const content = [{ type: 'text', text: LONG }]
+    const next = async () => ({ kind: 'accept', content })
+
+    const before = await handler({ name: 'ops_bash' }, { content }, next)
+    assert.notEqual(before.content, undefined, 'default 2000 annotates a 2000-char result')
+
+    // The panel POSTs this file; the hook must pick it up on the next call.
+    writeFileSync(join(root, 'home', 'context-archive.json'), JSON.stringify({ minChars: 5000 }))
+    const after = await handler({ name: 'ops_bash' }, { content }, next)
+    assert.equal(after.content, content, 'the higher threshold applies immediately')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -414,6 +450,148 @@ test('invalid config fails loudly instead of half-loading', async () => {
     const ctx = makeCtx(root)
     assert.throws(() => module.apply(ctx, { keepTurns: -1 }), /keepTurns/)
     assert.throws(() => module.apply(ctx, { annotate: 'yes' }), /annotate/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/** Fake res that records what a route handler wrote. */
+function makeRes() {
+  return {
+    status: 0,
+    headers: null,
+    body: '',
+    writeHead(status, headers) {
+      this.status = status
+      this.headers = headers
+    },
+    end(body) {
+      this.body = body ?? ''
+    },
+  }
+}
+
+test('stats and config routes answer over the host web server', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const routes = new Map()
+    const ctx = {
+      tools: { register() {} },
+      on() {},
+      inject(deps, callback) {
+        assert.deepEqual(deps, ['webServer'])
+        callback({
+          effect(fn) {
+            fn()
+          },
+          webServer: {
+            register(route) {
+              routes.set(route.path, route)
+              return () => routes.delete(route.path)
+            },
+          },
+        })
+      },
+      get() {
+        return undefined
+      },
+    }
+    module.apply(ctx, { annotateMinChars: 2000 })
+    assert.ok(routes.has('/dsh-context-archive/stats'))
+    assert.ok(routes.has('/dsh-context-archive/config'))
+
+    // GET /config reports defaults + effective values.
+    const configRes = makeRes()
+    routes.get('/dsh-context-archive/config').handler({ method: 'GET', url: '/dsh-context-archive/config' }, configRes)
+    assert.equal(configRes.status, 200)
+    const configPayload = JSON.parse(configRes.body)
+    assert.equal(configPayload.defaults.maxAnnotated, 200)
+    assert.equal(configPayload.effective.minChars, 2000)
+
+    // POST /config writes the runtime file the hooks read.
+    const { EventEmitter } = await import('node:events')
+    const req = new EventEmitter()
+    req.method = 'POST'
+    req.url = '/dsh-context-archive/config'
+    const writeRes = makeRes()
+    routes.get('/dsh-context-archive/config').handler(req, writeRes)
+    req.emit('data', JSON.stringify({ minChars: 500, keepTurns: 0 }))
+    req.emit('end')
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(writeRes.status, 200)
+    assert.equal(JSON.parse(writeRes.body).effective.minChars, 500)
+
+    const statsRes = makeRes()
+    routes.get('/dsh-context-archive/stats').handler({ method: 'GET', url: '/dsh-context-archive/stats' }, statsRes)
+    assert.equal(statsRes.status, 200)
+    const statsPayload = JSON.parse(statsRes.body)
+    assert.equal(statsPayload.buckets.length, 6)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('maxAnnotated caps how many live ids exist at once', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const session = makeSession([...pair('c0', 'ops_bash', annotationFor('aaaaaaaa') + LONG, { turn: 1 })])
+    const ctx = makeCtx(root)
+    module.apply(ctx, { minChars: 2000, maxAnnotated: 1 })
+    const handler = ctx.handlers.get('tools/post-execute')
+    const content = [{ type: 'text', text: 'z'.repeat(2500) }]
+    const decision = await handler(
+      { name: 'ops_bash', agent: { session } },
+      { content },
+      async () => ({ kind: 'accept', content }),
+    )
+    assert.equal(decision.content, content, 'the cap suppresses a second inline id')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('pre-step nudges once when enough results are archivable', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const events = []
+    for (let turn = 1; turn <= 8; turn++) events.push(...pair(`c${turn}`, 'ops_bash', 'n'.repeat(2500), { turn }))
+    const session = makeSession(events)
+    const ctx = makeCtx(root)
+    module.apply(ctx, { minChars: 2000, keepTurns: 3 })
+    const handler = ctx.handlers.get('agent/pre-step')
+    assert.equal(typeof handler, 'function', 'nudge hook registered')
+    const next = async () => ({ kind: 'enter', messages: [] })
+    const first = await handler({ agent: { session }, messages: [] }, next)
+    assert.equal(first.messages.length, 1, 'nudge appended to the request messages')
+    assert.match(first.messages[0].content[0].text, /context-archive/)
+    const second = await handler({ agent: { session }, messages: [] }, next)
+    assert.equal(second.messages.length, 0, 'throttled until the event gap passes')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('nudge message carries a producer-owned source kind that format v4 admits', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const events = []
+    for (let turn = 1; turn <= 8; turn++) events.push(...pair(`c${turn}`, 'ops_bash', 'n'.repeat(2500), { turn }))
+    const session = makeSession(events)
+    const ctx = makeCtx(root)
+    module.apply(ctx, { minChars: 2000, keepTurns: 3 })
+    const handler = ctx.handlers.get('agent/pre-step')
+    const next = async () => ({ kind: 'enter', messages: [] })
+    const decision = await handler({ agent: { session }, messages: [] }, next)
+    assert.equal(decision.messages.length, 1, 'nudge appended to the request messages')
+
+    // The nudge lands in a durable `user/message` slot, and format v4 refuses the retired
+    // v3 wrapper (`kind: 'plugin'`) there with "format v4 message requires a producer-owned
+    // source kind" — that refusal used to abort the whole turn.
+    const source = decision.messages[0].source
+    assert.equal(typeof source?.kind, 'string', 'nudge source carries a string kind')
+    assert.notEqual(source.kind, '', 'nudge source kind is not empty')
+    assert.notEqual(source.kind, 'plugin', 'the retired v3 plugin wrapper is not admissible')
+    assert.equal(source.kind, 'plugin:dsh-context-archive', 'the producer writes its own kind')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-archive",
-  "version": "0.3.0",
+  "version": "0.8.1",
   "description": "Model-driven tool-result archiving for DeepSeek Harness: long results carry an inline id, the model archives the ones it no longer needs into the session's own folder, and a recoverable stub stays in context.",
   "type": "module",
   "main": "./lib/index.js",
@@ -14,6 +14,7 @@
   },
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -35,6 +36,12 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "dsh-better-sidebar"
+      ]
     },
     "manifestVersion": 1
   },
