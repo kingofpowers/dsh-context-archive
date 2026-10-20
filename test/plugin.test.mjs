@@ -202,7 +202,7 @@ test('archive writes the original to the session folder and leaves a stub', asyn
     assert.ok(body.includes('note: 已提取字段'))
     assert.ok(body.endsWith(LONG), 'original text is preserved verbatim')
 
-    const replacement = session.log.at(-1)
+    const replacement = session.log.filter((event) => event.surfaceOp?.op === 'replace' && event.surfaceOp.startSeq === 1).at(-1)
     assert.equal(replacement.type, 'tool/result')
     assert.equal(replacement.surfaceOp.op, 'replace')
     assert.equal(replacement.surfaceOp.startSeq, 1)
@@ -231,7 +231,7 @@ test('archiving twice is idempotent and honours the turn guard', async () => {
       ...pair('c2', 'bash', LONG + 'b', { turn: 3 }),
     ])
     const ctx = makeCtx(root)
-    module.apply(ctx)
+    module.apply(ctx, { annotate: false })
     const oldId = hashId(LONG)
     const recentId = hashId(LONG + 'b')
 
@@ -592,6 +592,56 @@ test('nudge message carries a producer-owned source kind that format v4 admits',
     assert.notEqual(source.kind, '', 'nudge source kind is not empty')
     assert.notEqual(source.kind, 'plugin', 'the retired v3 plugin wrapper is not admissible')
     assert.equal(source.kind, 'plugin:dsh-context-archive', 'the producer writes its own kind')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('archiving reconciles inline ids with the current threshold', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const session = makeSession([
+      ...pair('c0', 'bash', annotationFor(hashId('old')) + 'a'.repeat(3000), { turn: 1 }),
+      ...pair('c1', 'bash', 'b'.repeat(2500), { turn: 2 }),
+      ...pair('c2', 'bash', 'c'.repeat(6000), { turn: 3 }),
+    ])
+    const ctx = makeCtx(root)
+    module.apply(ctx, { minChars: 2000, keepTurns: 0 })
+    const out = JSON.parse(
+      await ctx.tool.execute({ ids: [hashId('old')], keep_turns: 0 }, { agent: { session } }),
+    )
+    assert.equal(out.sync.added, 2, 'both remaining long results get ids')
+    const texts = session.log
+      .filter((event) => event.type === 'tool/result' && event.surfaceOp?.op === 'replace')
+      .map((event) => event.data.message.content[0].text)
+    assert.ok(texts.some((text) => text.startsWith(`[#${hashId('b'.repeat(2500))}]`)))
+    assert.ok(texts.some((text) => text.startsWith(`[#${hashId('c'.repeat(6000))}]`)))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('raising the threshold strips ids and the cap limits additions', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const session = makeSession([
+      ...pair('c0', 'bash', annotationFor(hashId('small')) + 's'.repeat(2500), { turn: 1 }),
+      ...pair('c1', 'bash', 'x'.repeat(3000), { turn: 2 }),
+      ...pair('c2', 'bash', 'y'.repeat(9000), { turn: 3 }),
+      ...pair('c3', 'bash', annotationFor(hashId('victim')) + 'v'.repeat(5000), { turn: 4 }),
+    ])
+    const ctx = makeCtx(root)
+    module.apply(ctx, { minChars: 4000, keepTurns: 0, maxAnnotated: 1 })
+    const out = JSON.parse(
+      await ctx.tool.execute({ ids: [hashId('victim')], keep_turns: 0 }, { agent: { session } }),
+    )
+    assert.equal(out.sync.removed, 1, 'the 2500 result is below the new threshold')
+    assert.equal(out.sync.added, 1, 'only the largest result fits under the cap')
+    const added = session.log
+      .filter((event) => event.type === 'tool/result' && event.surfaceOp?.op === 'replace')
+      .map((event) => event.data.message.content[0].text)
+    assert.ok(added.some((text) => text.startsWith(`[#${hashId('y'.repeat(9000))}]`)))
+    assert.ok(!added.some((text) => text.startsWith(`[#${hashId('x'.repeat(3000))}]`)))
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

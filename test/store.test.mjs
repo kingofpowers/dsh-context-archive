@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { StatsStore, readArchiveBuckets } from '../lib/store.js'
+import { StatsStore } from '../lib/store.js'
 
 function resultEvent(seq, text, turn = 1) {
   return {
@@ -84,8 +84,8 @@ test('snapshot joins archive rows and gives verdicts', () => {
     for (let index = 0; index < 4; index++) {
       store.apply(session, resultEvent(index, '[#aaaaaaaa · 5000 chars]\n' + 'z'.repeat(5000)))
     }
-    const archivedRows = new Map([['5k-20k', { archived: 3, annotated: 3, chars: 15000, stubs: 900 }]])
-    const rows = store.snapshot(archivedRows)
+    for (let i = 0; i < 3; i++) store.recordArchive({ chars: 5000, stubChars: 300 })
+    const rows = store.snapshot()
     const big = rows.find((row) => row.bucket === '5k-20k')
     assert.equal(big.annotated, 4)
     assert.equal(big.archived, 3)
@@ -111,29 +111,3 @@ test('counters persist across a restart', () => {
   }
 })
 
-test('readArchiveBuckets walks every session index', () => {
-  const home = mkdtempSync(join(tmpdir(), 'dsh-ca-store-'))
-  const previous = process.env.DSH_HOME
-  try {
-    process.env.DSH_HOME = home
-    const sessionDir = join(home, 'sessions', '--proj--', 'session-1', 'archives')
-    mkdirSync(sessionDir, { recursive: true })
-    writeFileSync(
-      join(sessionDir, 'index.json'),
-      JSON.stringify({
-        version: 1,
-        entries: {
-          a1: { chars: 5000, stubChars: 300 },
-          a2: { chars: 300, stubChars: 300 },
-        },
-      }),
-    )
-    const rows = readArchiveBuckets()
-    assert.equal(rows.get('5k-20k').archived, 1)
-    assert.equal(rows.get('5k-20k').chars, 5000)
-    assert.equal(rows.get('<500').archived, 1)
-  } finally {
-    process.env.DSH_HOME = previous
-    rmSync(home, { recursive: true, force: true })
-  }
-})
