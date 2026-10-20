@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-archive",
-  "version": "0.9.5",
+  "version": "0.9.8",
   "description": "Model-driven tool-result archiving for DeepSeek Harness: long results carry an inline id, the model archives the ones it no longer needs into the session's own folder, and a recoverable stub stays in context.",
   "type": "module",
   "main": "./lib/index.js",
