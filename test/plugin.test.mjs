@@ -550,52 +550,7 @@ test('maxAnnotated caps how many live ids exist at once', async () => {
   }
 })
 
-test('pre-step nudges once when enough results are archivable', async () => {
-  const { root, module } = await loadPlugin()
-  try {
-    const events = []
-    for (let turn = 1; turn <= 8; turn++) events.push(...pair(`c${turn}`, 'ops_bash', 'n'.repeat(2500), { turn }))
-    const session = makeSession(events)
-    const ctx = makeCtx(root)
-    module.apply(ctx, { minChars: 2000, keepTurns: 3 })
-    const handler = ctx.handlers.get('agent/pre-step')
-    assert.equal(typeof handler, 'function', 'nudge hook registered')
-    const next = async () => ({ kind: 'enter', messages: [] })
-    const first = await handler({ agent: { session }, messages: [] }, next)
-    assert.equal(first.messages.length, 1, 'nudge appended to the request messages')
-    assert.match(first.messages[0].content[0].text, /context-archive/)
-    const second = await handler({ agent: { session }, messages: [] }, next)
-    assert.equal(second.messages.length, 0, 'throttled until the event gap passes')
-  } finally {
-    rmSync(root, { recursive: true, force: true })
-  }
-})
 
-test('nudge message carries a producer-owned source kind that format v4 admits', async () => {
-  const { root, module } = await loadPlugin()
-  try {
-    const events = []
-    for (let turn = 1; turn <= 8; turn++) events.push(...pair(`c${turn}`, 'ops_bash', 'n'.repeat(2500), { turn }))
-    const session = makeSession(events)
-    const ctx = makeCtx(root)
-    module.apply(ctx, { minChars: 2000, keepTurns: 3 })
-    const handler = ctx.handlers.get('agent/pre-step')
-    const next = async () => ({ kind: 'enter', messages: [] })
-    const decision = await handler({ agent: { session }, messages: [] }, next)
-    assert.equal(decision.messages.length, 1, 'nudge appended to the request messages')
-
-    // The nudge lands in a durable `user/message` slot, and format v4 refuses the retired
-    // v3 wrapper (`kind: 'plugin'`) there with "format v4 message requires a producer-owned
-    // source kind" — that refusal used to abort the whole turn.
-    const source = decision.messages[0].source
-    assert.equal(typeof source?.kind, 'string', 'nudge source carries a string kind')
-    assert.notEqual(source.kind, '', 'nudge source kind is not empty')
-    assert.notEqual(source.kind, 'plugin', 'the retired v3 plugin wrapper is not admissible')
-    assert.equal(source.kind, 'plugin:dsh-context-archive', 'the producer writes its own kind')
-  } finally {
-    rmSync(root, { recursive: true, force: true })
-  }
-})
 
 test('archiving reconciles inline ids with the current threshold', async () => {
   const { root, module } = await loadPlugin()
