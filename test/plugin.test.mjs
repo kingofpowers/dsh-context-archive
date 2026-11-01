@@ -73,6 +73,9 @@ function makeSession(events) {
     get events() {
       return log
     },
+    get seq() {
+      return log.length
+    },
     eventAt(seq) {
       return log[seq]
     },
