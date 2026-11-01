@@ -70,6 +70,9 @@ function makeSession(events) {
     get log() {
       return log
     },
+    get events() {
+      return log
+    },
     eventAt(seq) {
       return log[seq]
     },
@@ -597,6 +600,173 @@ test('raising the threshold strips ids and the cap limits additions', async () =
       .map((event) => event.data.message.content[0].text)
     assert.ok(added.some((text) => text.startsWith(`[#${hashId('y'.repeat(9000))}]`)))
     assert.ok(!added.some((text) => text.startsWith(`[#${hashId('x'.repeat(3000))}]`)))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * Threshold reminder: injected at the first step of a turn, erased by
+ * the archive call that answers it.
+ * ------------------------------------------------------------------ */
+
+const NOTICE_TEXT = '[context-archive] 提示'
+
+function noticeEvent(seq = 0) {
+  return {
+    type: 'user/message',
+    time: 1_700_000_000_000,
+    data: {
+      id: `notice-${seq}`,
+      role: 'user',
+      source: { kind: 'runtime-context', form: 'notice', summary: '可归档量超过阈值' },
+      content: [{ type: 'text', text: `${NOTICE_TEXT}，有 1 条结果可以归档。` }],
+    },
+  }
+}
+
+function stepStart(turn, step) {
+  return { type: 'step/start', time: 1_700_000_000_000, data: { turn, step } }
+}
+
+/** Ask the pre-step listener for one step; the accept decision carries the user's message. */
+async function runPreStep(handler, session, turn, step = 1, extra = {}) {
+  const userMessage = { id: 'user-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'go on' }] }
+  return handler(
+    { agent: { session }, turn, step, signal: { aborted: false }, ...extra },
+    async () => ({ kind: 'enter', messages: [userMessage] }),
+  )
+}
+
+test('over the threshold, the first step of a turn carries one reminder', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const session = makeSession([
+      stepStart(1, 1),
+      ...pair('c0', 'bash', 'a'.repeat(4000), { turn: 1 }),
+    ])
+    const ctx = makeCtx(root)
+    module.apply(ctx, { keepTurns: 0, minChars: 2000, noticeChars: 3000 })
+    const handler = ctx.handlers.get('agent/pre-step')
+    assert.equal(typeof handler, 'function', 'pre-step listener registered')
+
+    const decision = await runPreStep(handler, session, 2)
+    assert.equal(decision.kind, 'enter')
+    assert.equal(decision.messages.length, 2, 'the user message stays and the reminder is appended')
+    const notice = decision.messages.at(-1)
+    assert.equal(notice.role, 'user')
+    assert.equal(notice.source.form, 'notice')
+    assert.ok(notice.content[0].text.startsWith('[context-archive]'))
+    assert.match(notice.content[0].text, /1 条工具结果/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('under the threshold, or on a later step, no reminder is injected', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const session = makeSession([stepStart(1, 1), ...pair('c0', 'bash', 'a'.repeat(900), { turn: 1 })])
+    const ctx = makeCtx(root)
+    module.apply(ctx, { keepTurns: 0, minChars: 2000, noticeChars: 3000 })
+    const handler = ctx.handlers.get('agent/pre-step')
+
+    assert.equal((await runPreStep(handler, session, 2)).messages.length, 1, 'below threshold: nothing')
+    const big = makeSession([stepStart(1, 1), ...pair('c0', 'bash', 'a'.repeat(4000), { turn: 1 })])
+    assert.equal((await runPreStep(handler, big, 2, 3)).messages.length, 1, 'only step 1 speaks')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('an unanswered reminder is refreshed after the cooldown, never duplicated', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const session = makeSession([stepStart(1, 1), ...pair('c0', 'bash', 'a'.repeat(4000), { turn: 1 })])
+    const ctx = makeCtx(root)
+    module.apply(ctx, { keepTurns: 0, minChars: 2000, noticeChars: 3000, noticeTurns: 3 })
+    const handler = ctx.handlers.get('agent/pre-step')
+
+    const first = await runPreStep(handler, session, 2)
+    assert.equal(first.messages.length, 2)
+    // The loop admits the batch; simulate that so the next turn can find it.
+    session.append('user/message', first.messages.at(-1), { surfaceOp: 'append' })
+
+    assert.equal((await runPreStep(handler, session, 3)).messages.length, 1, 'turn 2 stays quiet')
+    assert.equal((await runPreStep(handler, session, 4)).messages.length, 1, 'turn 3 still quiet')
+
+    const refresh = await runPreStep(handler, session, 5)
+    assert.equal(refresh.messages.length, 1, 'refresh happens in place')
+    const replaced = session.log.filter((event) => event.type === 'user/message' && event.surfaceOp?.op === 'replace')
+    assert.equal(replaced.length, 1)
+    assert.ok(replaced[0].data.content[0].text.startsWith('[context-archive]'))
+    assert.equal(
+      session.log.filter((event) => event.type === 'user/message' && event.surfaceOp === 'append').length,
+      1,
+      'still exactly one reminder on the surface',
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('archiving erases the reminder from the surface', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const old = 'o'.repeat(3000)
+    const session = makeSession([
+      stepStart(1, 1),
+      ...pair('c0', 'bash', old, { turn: 1 }),
+      noticeEvent(99),
+    ])
+    const ctx = makeCtx(root)
+    module.apply(ctx, { keepTurns: 0, minChars: 2000 })
+    const out = JSON.parse(
+      await ctx.tool.execute({ ids: [hashId(old)], keep_turns: 0 }, { agent: { session } }),
+    )
+    assert.equal(out.outcomes[0].status, 'archived')
+    assert.equal(out.noticeCleared, true)
+
+    const erase = session.log.at(-1)
+    assert.equal(erase.type, 'system/message')
+    assert.deepEqual(erase.data.message.content, [], 'an empty system node projects to nothing')
+    assert.equal(erase.surfaceOp.op, 'replace')
+    // stepStart(0), tool/call(1), tool/result(2), reminder(3)
+    assert.equal(erase.surfaceOp.startSeq, 3, 'it replaces the reminder node')
+    assert.deepEqual(erase.sourceEventSeqs, [3])
+    assert.equal(erase.data.turn, 1, 'system payloads carry the open step coordinates')
+    assert.equal(erase.data.step, 1)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a reminder is never inserted when the nudge switch is off', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const session = makeSession([stepStart(1, 1), ...pair('c0', 'bash', 'a'.repeat(4000), { turn: 1 })])
+    const ctx = makeCtx(root)
+    module.apply(ctx, { keepTurns: 0, minChars: 2000, noticeChars: 3000, nudge: false })
+    const handler = ctx.handlers.get('agent/pre-step')
+    assert.equal((await runPreStep(handler, session, 2)).messages.length, 1)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('the reminder adds ids for results that still lack one', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const session = makeSession([stepStart(1, 1), ...pair('c0', 'bash', 'a'.repeat(4000), { turn: 1 })])
+    const ctx = makeCtx(root)
+    module.apply(ctx, { keepTurns: 0, minChars: 2000, noticeChars: 3000 })
+    const handler = ctx.handlers.get('agent/pre-step')
+    await runPreStep(handler, session, 2)
+    const annotated = session.log.filter(
+      (event) => event.type === 'tool/result' && event.surfaceOp?.op === 'replace',
+    )
+    assert.equal(annotated.length, 1, 'the long result was numbered before the reminder went out')
+    assert.ok(annotated[0].data.message.content[0].text.startsWith(`[#${hashId('a'.repeat(4000))}]`))
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
