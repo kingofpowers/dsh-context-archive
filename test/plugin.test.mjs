@@ -771,3 +771,20 @@ test('the reminder adds ids for results that still lack one', async () => {
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('an empty first batch never opens a step just to show the reminder', async () => {
+  const { root, module } = await loadPlugin()
+  try {
+    const session = makeSession([stepStart(1, 1), ...pair('c0', 'bash', 'a'.repeat(4000), { turn: 1 })])
+    const ctx = makeCtx(root)
+    module.apply(ctx, { keepTurns: 0, minChars: 2000, noticeChars: 3000 })
+    const handler = ctx.handlers.get('agent/pre-step')
+    const decision = await handler({ agent: { session }, turn: 2, step: 1, signal: {} }, async () => ({
+      kind: 'enter',
+      messages: [],
+    }))
+    assert.deepEqual(decision.messages, [], 'no input, no reminder')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
