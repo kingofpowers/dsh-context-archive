@@ -165,10 +165,28 @@ dsh plugin --profile web add dsh-context-archive
 dsh plugin --profile desktop add link:<path-to-this-folder>
 ```
 
+### 兼容性（engines.dsh）
+
+DSH 在装载前会把 `engines.dsh` 与运行版本做 SemVer 比较（`includePrerelease`，声明了 `engines.dsh` 就忽略 peer 范围）。范围**必须写成开区间**，不要钉死具体版本：
+
+```json
+"engines": { "dsh": ">=0.2.1-rc.1 <0.3.0" }
+```
+
+`0.2.1-rc.1 || 0.2.1-rc.2` 这种写法在下一个 rc 就会整包被拒绝（0.10.2 就是这样撞上 0.2.1-rc.5 的）。`npm test` 的 `pretest` 会读本机 asar 里的运行时版本先做一次同样的检查：
+
+```sh
+node scripts/check-compat.mjs              # 自动发现本机 DSH
+DSH_VERSION=0.2.1-rc.5 node scripts/check-compat.mjs   # 显式指定
+DSH_ASAR=/path/to/app.asar node scripts/check-compat.mjs
+```
+
+发现不兼容时会直接让 `npm test` 失败，避免又发一个装不上的版本。
+
 开发验证：
 
 ```sh
-npm test    # node --test，54 个用例，零依赖
+npm test    # 先跑兼容性检查，再跑 node --test，60 个用例，零依赖
 ```
 
 ## 安全说明
